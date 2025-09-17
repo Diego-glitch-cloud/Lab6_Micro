@@ -39,3 +39,7 @@
 
 # debug information files
 *.dwo
+
+# file too big to be commited
+paralelismo_teoria.txt
+
