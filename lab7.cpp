@@ -67,7 +67,7 @@ void* compressWorker(void* arg) {
         vector<uint8_t> dest(dest_len);
         const Bytef* src = reinterpret_cast<const Bytef*>(S->data + start);
 
-        int r = compress2(dest.data(), &dest_len, src, static_cast<uLong>(orig_size), Z_DEFAULT_COMPRESSION);
+        int r = compress(dest.data(), &dest_len, src, static_cast<uLong>(orig_size));
         if (r != Z_OK) {
             cerr << "Error zlib compress idx=" << idx << " code=" << r << "\n";
             (*S->headers)[idx] = {0, orig_size};
@@ -127,6 +127,7 @@ void* decompressWorker(void* arg) {
     return nullptr;
 }
 
+
 void compressFile(const string& in_name, const string& out_name) {
     ifstream ifs(in_name, ios::binary | ios::ate);
     if (!ifs) { cerr << "No se pudo abrir " << in_name << "\n"; return; }
@@ -185,6 +186,7 @@ void compressFile(const string& in_name, const string& out_name) {
     cout << "Compresión finalizada en " << dur.count() << " s\n";
     cout << "Tamaño comprimido total: " << compressed_total << " bytes\n";
 }
+
 
 void decompressFile(const string& in_name, const string& out_name) {
     ifstream ifs(in_name, ios::binary | ios::ate);
@@ -251,8 +253,10 @@ void decompressFile(const string& in_name, const string& out_name) {
     cout << "Descompresión finalizada en " << dur.count() << " s\n";
 }
 
+
+
 int main() {
-    int opcion = 0;
+    int opcion = 0; // Menu 
     do {
         cout << "Seleccione una opcion:\n1. Comprimir archivo\n2. Descomprimir archivo previamente comprimido\nIngrese su opcion: ";
         if (!(cin >> opcion)) { cin.clear(); cin.ignore(256, '\n'); opcion = 0; }
