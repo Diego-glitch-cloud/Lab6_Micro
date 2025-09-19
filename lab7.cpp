@@ -10,6 +10,9 @@
 #include <semaphore.h>
 #include <zlib.h>
 
+// VIDEO: https://youtu.be/QNnk2UyBH2Y
+// GITHUB: https://github.com/Diego-glitch-cloud/Lab7_Micro.git
+
 using namespace std;
 
 // Sirve para que el descompresor sepa cuanto leer y escribir (evitar segmentation fault)
