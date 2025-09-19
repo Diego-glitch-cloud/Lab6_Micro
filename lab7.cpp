@@ -1,181 +1,273 @@
 #include <iostream>
-#include <cstdio>
 #include <fstream>
 #include <vector>
+#include <cstdint>
+#include <cstring>
+#include <algorithm>
+#include <chrono>
+#include <atomic>
 #include <pthread.h>
-#include <chrono> // Para medir el tiempo
-#include <zlib.h> // Para la compresión DEFLATE
+#include <semaphore.h>
+#include <zlib.h>
+
 using namespace std;
 
-
-// Estructura para pasar argumentos a los hilos
-struct ThreadArgs {
-    vector<char>* input_data;
-    size_t start_index;
-    size_t end_index;
-    vector<char>* compressed_data;
+// Sirve para que el descompresor sepa cuanto leer y escribir (evitar segmentation fault)
+struct BlockHeader {
+    uint64_t compressed_size;
+    uint64_t original_size;
 };
 
-// Subrutina que cada hilo ejecutará para comprimir un bloque
-void* compressBlock(void* args) {
-    ThreadArgs* thread_args = static_cast<ThreadArgs*>(args);
-    
-    // Obtener el bloque de datos a comprimir
-    const vector<char>& input_data = *thread_args->input_data;
-    size_t block_size = thread_args->end_index - thread_args->start_index;
-    const Bytef* source = reinterpret_cast<const Bytef*>(&input_data[thread_args->start_index]);
-    
-    // Preparar el buffer de salida
-    uLongf dest_len = compressBound(block_size);
-    vector<char> compressed_buffer(dest_len);
-    Bytef* dest = reinterpret_cast<Bytef*>(compressed_buffer.data());
-    
-    // Comprimir el bloque
-    int result = compress(dest, &dest_len, source, block_size);
-    
-    if (result == Z_OK) {
-        // Redimensionar el buffer al tamaño real de los datos comprimidos
-        compressed_buffer.resize(dest_len);
-        
-        // Guardar el resultado comprimido en la estructura de argumentos
-        thread_args->compressed_data = new vector<char>(compressed_buffer);
-    } else {
-        thread_args->compressed_data = nullptr;
-        cerr << "Error de compresion en el hilo. Codigo: " << result << endl;
-    }
+// Estructura que se comparte en los hilos
+struct CompressShared {
+    const uint8_t* data;
+    uint64_t file_size;
+    uint64_t block_size;
+    size_t num_blocks;
+    atomic<size_t>* next_block;
+    vector<vector<uint8_t>>* out_blocks;
+    vector<BlockHeader>* headers;
+};
 
-    pthread_exit(NULL);
+
+struct Meta { uint64_t offset; uint64_t compressed_size; uint64_t original_size; }; // Necesario para los metadatos en la descompersión
+
+// Se comparte entre los hilos y contiene
+struct DecompressShared {
+    const uint8_t* data;
+    vector<Meta>* metas;
+    atomic<size_t>* next_index;
+    sem_t* sems;
+    FILE* out_file;
+    size_t num_blocks;
+};
+
+void* compressWorker(void* arg) {
+    auto* S = static_cast<CompressShared*>(arg);
+    while (true) {
+        size_t idx = S->next_block->fetch_add(1);
+        if (idx >= S->num_blocks) break;
+
+        uint64_t start = uint64_t(idx) * S->block_size;
+        uint64_t end = min(S->file_size, start + S->block_size);
+        uint64_t orig_size = end - start;
+
+        if (orig_size == 0) {
+            (*S->headers)[idx] = {0, 0};
+            continue;
+        }
+
+        if (orig_size > numeric_limits<uLong>::max()) {
+            cerr << "Bloque demasiado grande para zlib (idx=" << idx << ")\n";
+            (*S->headers)[idx] = {0, orig_size};
+            continue;
+        }
+
+        uLongf dest_len = compressBound(static_cast<uLong>(orig_size));
+        vector<uint8_t> dest(dest_len);
+        const Bytef* src = reinterpret_cast<const Bytef*>(S->data + start);
+
+        int r = compress2(dest.data(), &dest_len, src, static_cast<uLong>(orig_size), Z_DEFAULT_COMPRESSION);
+        if (r != Z_OK) {
+            cerr << "Error zlib compress idx=" << idx << " code=" << r << "\n";
+            (*S->headers)[idx] = {0, orig_size};
+            (*S->out_blocks)[idx].clear();
+            continue;
+        }
+        dest.resize(dest_len);
+        (*S->out_blocks)[idx] = std::move(dest);
+        (*S->headers)[idx] = {static_cast<uint64_t>(dest_len), orig_size};
+    }
+    return nullptr;
 }
 
+void* decompressWorker(void* arg) {
+    auto* S = static_cast<DecompressShared*>(arg);
+    while (true) {
+        size_t idx = S->next_index->fetch_add(1);
+        if (idx >= S->num_blocks) break;
 
+        Meta m = (*S->metas)[idx];
 
-// Función principal de compresión
-void compressFile(const string& input_filename, const string& output_filename) {
-    // 1. Lectura del archivo de entrada
-    ifstream inputFile(input_filename, ios::binary | ios::ate);
-    if (!inputFile.is_open()) {
-        printf("Error: No se pudo abrir el archivo de entrada.\n");
-        return;
-    }
-    
-    streampos file_size = inputFile.tellg();
-    inputFile.seekg(0, ios::beg);
-    
-    vector<char> input_data(file_size);
-    inputFile.read(input_data.data(), file_size);
-    inputFile.close();
-    
-    printf("Archivo de entrada leido. Tamano original: %ld bytes.\n", file_size);
-
-    // 2. Solicitud de hilos
-    int num_threads;
-    printf("Ingrese la cantidad de hilos a utilizar: ");
-    cin >> num_threads;
-    
-    if (num_threads <= 0) {
-        printf("Numero de hilos no valido. Se usara 1 hilo por defecto.\n");
-        num_threads = 1;
-    }
-
-    // 3. Medición del tiempo de ejecución
-    auto start_time = chrono::high_resolution_clock::now();
-
-    // Lógica de paralelización
-    size_t block_size = file_size / num_threads;
-    vector<pthread_t> threads(num_threads);
-    vector<ThreadArgs> thread_args(num_threads);
-    
-    // Crear los hilos y asignar los bloques
-    for (int i = 0; i < num_threads; ++i) {
-        thread_args[i].input_data = &input_data;
-        thread_args[i].start_index = i * block_size;
-        
-        // El último hilo toma el resto del archivo
-        if (i == num_threads - 1) {
-            thread_args[i].end_index = file_size;
-        } else {
-            thread_args[i].end_index = (i + 1) * block_size;
+        if (m.original_size == 0) {
+            // nothing to write (or error-case)
+            sem_wait(&S->sems[idx]);
+            sem_post(&S->sems[idx+1]);
+            continue;
         }
-        
-        // Crear el hilo
-        int result = pthread_create(&threads[i], NULL, compressBlock, &thread_args[i]);
-        if (result != 0) {
-            cerr << "Error al crear el hilo " << i << endl;
-        }
-    }
-    
-    // Esperar a que todos los hilos terminen
-    for (int i = 0; i < num_threads; ++i) {
-        pthread_join(threads[i], NULL);
-    }
-    
-    // 4. Escribir el archivo comprimido final
-    ofstream outputFile(output_filename, ios::binary);
-    if (!outputFile.is_open()) {
-        printf("Error: No se pudo abrir el archivo de salida.\n");
-        return;
-    }
-    
-    size_t compressed_size = 0;
-    for (int i = 0; i < num_threads; ++i) {
-        if (thread_args[i].compressed_data) {
-            outputFile.write(thread_args[i].compressed_data->data(), thread_args[i].compressed_data->size());
-            compressed_size += thread_args[i].compressed_data->size();
-            delete thread_args[i].compressed_data; // Liberar memoria
-        }
-    }
-    outputFile.close();
 
-    // 5. Medición final del tiempo y resultados
-    auto end_time = chrono::high_resolution_clock::now();
-    chrono::duration<double> duration = end_time - start_time;
-    
-    printf("Compresion finalizada.\n");
-    printf("Tiempo de ejecucion: %.4f segundos.\n", duration.count());
-    printf("Tamano original: %ld bytes.\n", file_size);
-    printf("Tamano comprimido: %ld bytes.\n", compressed_size);
+        if (m.original_size > numeric_limits<uLongf>::max() || m.compressed_size > numeric_limits<uLong>::max()) {
+            cerr << "Bloque demasiado grande para zlib en descompresion idx=" << idx << "\n";
+            sem_wait(&S->sems[idx]);
+            sem_post(&S->sems[idx+1]);
+            continue;
+        }
+
+        vector<uint8_t> dest(m.original_size);
+        uLongf dest_len = static_cast<uLongf>(m.original_size);
+        const Bytef* src = reinterpret_cast<const Bytef*>(S->data + m.offset);
+        int r = uncompress(dest.data(), &dest_len, src, static_cast<uLong>(m.compressed_size));
+        if (r != Z_OK) {
+            cerr << "Error zlib uncompress idx=" << idx << " code=" << r << "\n";
+            // still preserve ordering: consume semaphore and pass it on
+            sem_wait(&S->sems[idx]);
+            sem_post(&S->sems[idx+1]);
+            continue;
+        }
+
+        // Esperar turno para escribir en orden
+        sem_wait(&S->sems[idx]);
+        size_t written = fwrite(dest.data(), 1, dest_len, S->out_file);
+        if (written != dest_len) {
+            cerr << "Error escritura bloque idx=" << idx << " bytes escritos=" << written << " esperados=" << dest_len << "\n";
+        }
+        fflush(S->out_file);
+        sem_post(&S->sems[idx+1]);
+    }
+    return nullptr;
 }
 
+void compressFile(const string& in_name, const string& out_name) {
+    ifstream ifs(in_name, ios::binary | ios::ate);
+    if (!ifs) { cerr << "No se pudo abrir " << in_name << "\n"; return; }
+    uint64_t file_size = static_cast<uint64_t>(ifs.tellg());
+    ifs.seekg(0, ios::beg);
+    vector<uint8_t> data(file_size ? file_size : 0);
+    if (file_size) ifs.read(reinterpret_cast<char*>(data.data()), file_size);
+    ifs.close();
+
+    cout << "Tamaño original: " << file_size << " bytes\n";
+    int threads_input;
+    cout << "Ingrese la cantidad de hilos a utilizar: ";
+    if (!(cin >> threads_input) || threads_input <= 0) threads_input = 1;
+    size_t num_threads = static_cast<size_t>(threads_input);
+
+    if (file_size == 0) {
+        cerr << "Archivo vacío. Nada que comprimir.\n";
+        return;
+    }
+
+    uint64_t block_size = file_size / num_threads;
+    if (block_size == 0) block_size = 1;
+    size_t num_blocks = static_cast<size_t>((file_size + block_size - 1) / block_size);
+
+    vector<vector<uint8_t>> out_blocks(num_blocks);
+    vector<BlockHeader> headers(num_blocks);
+    atomic<size_t> next_block(0);
+
+    CompressShared shared{ data.empty() ? nullptr : data.data(),
+                          file_size, block_size, num_blocks,
+                          &next_block, &out_blocks, &headers };
+
+    size_t workers = min(num_threads, num_blocks);
+    vector<pthread_t> worker_threads(workers);
+    auto t0 = chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < workers; ++i) {
+        if (pthread_create(&worker_threads[i], nullptr, compressWorker, &shared) != 0)
+            cerr << "Error creando hilo compresion " << i << "\n";
+    }
+    for (size_t i = 0; i < workers; ++i) pthread_join(worker_threads[i], nullptr);
+
+    // Escribir archivo comprimido (cabeceras + bloques)
+    ofstream ofs(out_name, ios::binary);
+    if (!ofs) { cerr << "No se pudo crear " << out_name << "\n"; return; }
+    uint64_t compressed_total = 0;
+    for (size_t i = 0; i < num_blocks; ++i) {
+        ofs.write(reinterpret_cast<const char*>(&headers[i]), sizeof(BlockHeader));
+        if (headers[i].compressed_size && !out_blocks[i].empty()) {
+            ofs.write(reinterpret_cast<const char*>(out_blocks[i].data()), out_blocks[i].size());
+            compressed_total += out_blocks[i].size();
+        }
+    }
+    ofs.close();
+    auto t1 = chrono::high_resolution_clock::now();
+    chrono::duration<double> dur = t1 - t0;
+    cout << "Compresión finalizada en " << dur.count() << " s\n";
+    cout << "Tamaño comprimido total: " << compressed_total << " bytes\n";
+}
+
+void decompressFile(const string& in_name, const string& out_name) {
+    ifstream ifs(in_name, ios::binary | ios::ate);
+    if (!ifs) { cerr << "No se pudo abrir " << in_name << "\n"; return; }
+    uint64_t file_size = static_cast<uint64_t>(ifs.tellg());
+    ifs.seekg(0, ios::beg);
+    vector<uint8_t> data(file_size ? file_size : 0);
+    if (file_size) ifs.read(reinterpret_cast<char*>(data.data()), file_size);
+    ifs.close();
+
+    cout << "Tamaño comprimido leído: " << file_size << " bytes\n";
+    // Parse headers -> metas
+    vector<Meta> metas;
+    uint64_t pos = 0;
+    while (pos + sizeof(BlockHeader) <= file_size) {
+        BlockHeader h;
+        memcpy(&h, data.data() + pos, sizeof(BlockHeader));
+        pos += sizeof(BlockHeader);
+        if (pos + h.compressed_size > file_size) {
+            cerr << "Bloque parcial encontrado. Ignorando resto.\n";
+            break;
+        }
+        metas.push_back(Meta{pos, h.compressed_size, h.original_size});
+        pos += h.compressed_size;
+    }
+    size_t num_blocks = metas.size();
+    if (num_blocks == 0) { cerr << "No se encontraron bloques.\n"; return; }
+
+    int threads_input;
+    cout << "Ingrese la cantidad de hilos a utilizar: ";
+    if (!(cin >> threads_input) || threads_input <= 0) threads_input = 1;
+    size_t num_threads = static_cast<size_t>(threads_input);
+
+    // Inicializar semáforos para orden de escritura
+    vector<sem_t> sems(num_blocks + 1);
+    for (size_t i = 0; i <= num_blocks; ++i) {
+        sem_init(&sems[i], 0, 0);
+    }
+    sem_post(&sems[0]); // permitir que el primer bloque se escriba
+
+    FILE* out = fopen(out_name.c_str(), "wb");
+    if (!out) { cerr << "No se pudo crear " << out_name << "\n"; 
+        for (size_t i = 0; i <= num_blocks; ++i) sem_destroy(&sems[i]);
+        return;
+    }
+
+    atomic<size_t> next_index(0);
+    DecompressShared shared{ data.empty() ? nullptr : data.data(), &metas, &next_index, sems.data(), out, num_blocks };
+
+    size_t workers = min(num_threads, num_blocks);
+    vector<pthread_t> threads(workers);
+    auto t0 = chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < workers; ++i) {
+        if (pthread_create(&threads[i], nullptr, decompressWorker, &shared) != 0)
+            cerr << "Error creando hilo descompresion " << i << "\n";
+    }
+    for (size_t i = 0; i < workers; ++i) pthread_join(threads[i], nullptr);
+
+    fclose(out);
+    for (size_t i = 0; i <= num_blocks; ++i) sem_destroy(&sems[i]);
+
+    auto t1 = chrono::high_resolution_clock::now();
+    chrono::duration<double> dur = t1 - t0;
+    cout << "Descompresión finalizada en " << dur.count() << " s\n";
+}
 
 int main() {
-    int opcion;
-
+    int opcion = 0;
     do {
-        printf("Seleccione una opcion:\n");
-        printf("1. Comprimir archivo\n");
-        printf("2. Descomprimir archivo previamente comprimido\n");
-        printf("Ingrese su opcion: ");
-        
-        cin >> opcion;
-
-        if (cin.fail()) {
-            printf("Entrada no valida. Por favor, ingrese un numero.\n");
-            cin.clear();
-            cin.ignore(256, '\n');
-            opcion = 0;
-        } else if (opcion != 1 && opcion != 2) {
-            printf("Opcion no valida. Por favor, ingrese 1 o 2.\n");
-        }
-
+        cout << "Seleccione una opcion:\n1. Comprimir archivo\n2. Descomprimir archivo previamente comprimido\nIngrese su opcion: ";
+        if (!(cin >> opcion)) { cin.clear(); cin.ignore(256, '\n'); opcion = 0; }
     } while (opcion != 1 && opcion != 2);
-    
-    
+
     if (opcion == 1) {
-        printf("Ha seleccionado la opcion de compresion.\n");
-        printf("Ha seleccionado la opcion de compresion.\n");
-        string input_file = "paralelismo_teoria.txt";
-        string output_file = "paralelismo_comprimido.bin";
-        compressFile(input_file, output_file);
-
-
+        cout << "Compresión seleccionada.\n";
+        string in = "paralelismo_teoria.txt";
+        string out = "paralelismo_comprimido.bin";
+        compressFile(in, out);
     } else {
-        printf("Ha seleccionado la opcion de descompresion.\n");
-        
-
-
-
-
+        cout << "Descompresión seleccionada.\n";
+        string in = "paralelismo_comprimido.bin";
+        string out = "paralelismo_descomprimido.txt";
+        decompressFile(in, out);
     }
-
     return 0;
 }
